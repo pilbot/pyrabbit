@@ -31,27 +31,6 @@ class PermissionError(Exception):
     pass
 
 
-def needs_admin_privs(fun):
-    """
-    A decorator that can be added to any of the Client methods in order to
-    indicate that admin privileges should be checked for before issuing an
-    HTTP call (if possible - if Client.is_admin isn't set, an HTTP call is
-    made to find out).
-
-    """
-    @functools.wraps(fun)
-    def wrapper(self, *args, **kwargs):
-        """
-        This is the function that runs in place of the one being decorated.
-
-        """
-        if self.has_admin_rights:
-            return fun(self, *args, **kwargs)
-        else:
-            raise PermissionError("Insufficient privs. User '%s'" % self.user)
-    return wrapper
-
-
 class Client(object):
     """
     Abstraction of the RabbitMQ Management HTTP API.
@@ -114,14 +93,23 @@ class Client(object):
             self.timeout
         )
 
-        # initialize this now. @needs_admin_privs will check this first to
-        # avoid making an HTTP call. If this is None, it'll trigger an
-        # HTTP call (by calling self.has_admin_rights) and populate this for
-        # next time.
-        self.is_admin = None
         return
 
-    @needs_admin_privs
+    def _call(self, path, method, body=None, headers=None):
+        """
+        Wrapper around http.do_call that transforms some HTTPError into
+        our own exceptions
+        """
+        try:
+            resp = self.http.do_call(path, method, body, headers)
+        except http.HTTPError as err:
+            if err.status == 401:
+                raise PermissionError('Insufficient permissions to query ' +
+                    '%s with user %s :%s' % (path, self.user, err))
+            raise
+        return resp
+
+
     def is_alive(self, vhost='%2F'):
         """
         Uses the aliveness-test API call to determine if the
@@ -137,7 +125,7 @@ class Client(object):
         uri = Client.urls['live_test'] % vhost
 
         try:
-            resp = self.http.do_call(uri, 'GET')
+            resp = self._call(uri, 'GET')
         except http.HTTPError as err:
             if err.status == 404:
                 raise APIError("No vhost named '%s'" % vhost)
@@ -159,24 +147,8 @@ class Client(object):
             * auth_backend: backend used to determine admin rights
         """
         path = Client.urls['whoami']
-        whoami = self.http.do_call(path, 'GET')
+        whoami = self._call(path, 'GET')
         return whoami
-
-    @property
-    def has_admin_rights(self):
-        """
-        Determine if the creds passed in for authentication have admin
-        rights to RabbitMQ data. If not, then there's a decent amount of
-        information you can't get at.
-
-        :returns bool is_admin: True if self.user has admin rights.
-
-        """
-        if self.is_admin is None:
-            whoami = self.get_whoami()
-            self.is_admin = whoami.get('tags', '') == 'administrator'
-
-        return self.is_admin
 
     def get_overview(self):
         """
@@ -187,9 +159,8 @@ class Client(object):
         some high-level message stats, and aggregate queue totals. Admin-level
         creds gets you information about the cluster node, listeners, etc.
 
-
         """
-        overview = self.http.do_call(Client.urls['overview'], 'GET')
+        overview = self._call(Client.urls['overview'], 'GET')
         return overview
 
     def get_nodes(self):
@@ -201,23 +172,18 @@ class Client(object):
 
 
         """
-        nodes = self.http.do_call(Client.urls['all_nodes'], 'GET')
+        nodes = self._call(Client.urls['all_nodes'], 'GET')
         return nodes
 
-    @needs_admin_privs
     def get_users(self):
         """
         Returns a list of dictionaries, each containing the attributes of a
         different RabbitMQ user.
 
-        :returns: a list of dictionaries, each representing a user. This
-              method is decorated with '@needs_admin_privs', and will raise
-              an error if the credentials used to set up the broker connection
-              do not have admin privileges.
+        :returns: a list of dictionaries, each representing a user.
 
         """
-
-        users = self.http.do_call(Client.urls['all_users'], 'GET')
+        users = self._call(Client.urls['all_users'], 'GET')
         return users
 
     ################################################
@@ -231,7 +197,7 @@ class Client(object):
                 on the broker.
 
         """
-        vhosts = self.http.do_call(Client.urls['all_vhosts'], 'GET')
+        vhosts = self._call(Client.urls['all_vhosts'], 'GET')
         return vhosts
 
     def get_vhost_names(self):
@@ -256,7 +222,7 @@ class Client(object):
 
         vname = quote(vname, '')
         path = Client.urls['vhosts_by_name'] % vname
-        vhost = self.http.do_call(path, 'GET', headers=Client.json_headers)
+        vhost = self._call(path, 'GET', headers=Client.json_headers)
         return vhost
 
     def create_vhost(self, vname):
@@ -268,7 +234,7 @@ class Client(object):
         """
         vname = quote(vname, '')
         path = Client.urls['vhosts_by_name'] % vname
-        return self.http.do_call(path, 'PUT',
+        return self._call(path, 'PUT',
                                  headers=Client.json_headers)
 
     def delete_vhost(self, vname):
@@ -280,7 +246,7 @@ class Client(object):
         """
         vname = quote(vname, '')
         path = Client.urls['vhosts_by_name'] % vname
-        return self.http.do_call(path, 'DELETE')
+        return self._call(path, 'DELETE')
 
     ###############################################
     ##           PERMISSIONS
@@ -290,7 +256,7 @@ class Client(object):
         :returns: list of dicts, or an empty list if there are no permissions.
         """
         path = Client.urls['all_permissions']
-        conns = self.http.do_call(path, 'GET')
+        conns = self._call(path, 'GET')
         return conns
 
     def get_vhost_permissions(self, vname):
@@ -302,7 +268,7 @@ class Client(object):
         """
         vname = quote(vname, '')
         path = Client.urls['vhost_permissions_get'] % (vname,)
-        conns = self.http.do_call(path, 'GET')
+        conns = self._call(path, 'GET')
         return conns
 
     def get_user_permissions(self, username):
@@ -314,7 +280,7 @@ class Client(object):
         """
 
         path = Client.urls['user_permissions'] % (username,)
-        conns = self.http.do_call(path, 'GET')
+        conns = self._call(path, 'GET')
         return conns
 
     def set_vhost_permissions(self, vname, username, config, rd, wr):
@@ -339,7 +305,7 @@ class Client(object):
         vname = quote(vname, '')
         body = json.dumps({"configure": config, "read": rd, "write": wr})
         path = Client.urls['vhost_permissions'] % (vname, username)
-        return self.http.do_call(path, 'PUT', body,
+        return self._call(path, 'PUT', body,
                                  headers=Client.json_headers)
 
     def delete_permission(self, vname, username):
@@ -352,7 +318,7 @@ class Client(object):
         """
         vname = quote(vname, '')
         path = Client.urls['vhost_permissions'] % (vname, username)
-        return self.http.do_call(path, 'DELETE')
+        return self._call(path, 'DELETE')
 
     def get_permission(self, vname, username):
         """
@@ -363,7 +329,7 @@ class Client(object):
         """
         vname = quote(vname, '')
         path = Client.urls['vhost_permissions'] % (vname, username)
-        return self.http.do_call(path, 'GET')
+        return self._call(path, 'GET')
 
     ###############################################
     ##           EXCHANGES
@@ -381,7 +347,7 @@ class Client(object):
         else:
             path = Client.urls['all_exchanges']
 
-        exchanges = self.http.do_call(path, 'GET')
+        exchanges = self._call(path, 'GET')
         return exchanges
 
     def get_exchange(self, vhost, name):
@@ -396,7 +362,7 @@ class Client(object):
         vhost = quote(vhost, '')
         name = quote(name, '')
         path = Client.urls['exchange_by_name'] % (vhost, name)
-        exch = self.http.do_call(path, 'GET')
+        exch = self._call(path, 'GET')
         return exch
 
     def create_exchange(self,
@@ -443,7 +409,7 @@ class Client(object):
                      "arguments": arguments or list()}
 
         body = json.dumps(base_body)
-        self.http.do_call(path, 'PUT', body,
+        self._call(path, 'PUT', body,
                           headers=Client.json_headers)
         return True
 
@@ -467,7 +433,7 @@ class Client(object):
         body = json.dumps({'routing_key': rt_key, 'payload': payload,
                            'payload_encoding': payload_enc,
                            'properties': properties or {}})
-        result = self.http.do_call(path, 'POST', body)
+        result = self._call(path, 'POST', body)
         return result['routed']
 
     def delete_exchange(self, vhost, name):
@@ -483,7 +449,7 @@ class Client(object):
         vhost = quote(vhost, '')
         name = quote(name, '')
         path = Client.urls['exchange_by_name'] % (vhost, name)
-        self.http.do_call(path, 'DELETE')
+        self._call(path, 'DELETE')
         return True
 
     #############################################
@@ -507,7 +473,7 @@ class Client(object):
         else:
             path = Client.urls['all_queues']
 
-        queues = self.http.do_call(path, 'GET')
+        queues = self._call(path, 'GET')
         return queues or list()
 
     def get_queue(self, vhost, name):
@@ -525,7 +491,7 @@ class Client(object):
         vhost = quote(vhost, '')
         name = quote(name, '')
         path = Client.urls['queues_by_name'] % (vhost, name)
-        queue = self.http.do_call(path, 'GET')
+        queue = self._call(path, 'GET')
         return queue
 
     def get_queue_depth(self, vhost, name):
@@ -543,7 +509,7 @@ class Client(object):
         vhost = quote(vhost, '')
         name = quote(name, '')
         path = Client.urls['queues_by_name'] % (vhost, name)
-        queue = self.http.do_call(path, 'GET')
+        queue = self._call(path, 'GET')
         depth = queue['messages']
 
         return depth
@@ -563,7 +529,7 @@ class Client(object):
         if not names:
             # get all queues in vhost
             path = Client.urls['queues_by_vhost'] % vhost
-            queues = self.http.do_call(path, 'GET')
+            queues = self._call(path, 'GET')
             for queue in queues:
                 depth = queue['messages']
                 print("\t%s: %s" % (queue, depth))
@@ -585,7 +551,7 @@ class Client(object):
             vhost = quote(vhost, '')
             name = quote(name, '')
             path = Client.urls['purge_queue'] % (vhost, name)
-            self.http.do_call(path, 'DELETE')
+            self._call(path, 'DELETE')
         return True
 
     def purge_queue(self, vhost, name):
@@ -602,7 +568,7 @@ class Client(object):
         vhost = quote(vhost, '')
         name = quote(name, '')
         path = Client.urls['purge_queue'] % (vhost, name)
-        return self.http.do_call(path, 'DELETE')
+        return self._call(path, 'DELETE')
 
     def create_queue(self, vhost, name, **kwargs):
         """
@@ -624,7 +590,7 @@ class Client(object):
 
         body = json.dumps(kwargs)
 
-        return self.http.do_call(path,
+        return self._call(path,
                                  'PUT',
                                  body,
                                  headers=Client.json_headers)
@@ -642,7 +608,7 @@ class Client(object):
         vhost = quote(vhost, '')
         qname = quote(qname, '')
         path = Client.urls['queues_by_name'] % (vhost, qname)
-        return self.http.do_call(path, 'DELETE', headers=Client.json_headers)
+        return self._call(path, 'DELETE', headers=Client.json_headers)
 
     def get_messages(self, vhost, qname, count=1,
                      requeue=False, truncate=None, encoding='auto'):
@@ -669,7 +635,7 @@ class Client(object):
 
         qname = quote(qname, '')
         path = Client.urls['get_from_queue'] % (vhost, qname)
-        messages = self.http.do_call(path, 'POST', body,
+        messages = self._call(path, 'POST', body,
                                      headers=Client.json_headers)
         return messages
 
@@ -681,7 +647,7 @@ class Client(object):
         :returns: list of dicts, or an empty list if there are no connections.
         """
         path = Client.urls['all_connections']
-        conns = self.http.do_call(path, 'GET')
+        conns = self._call(path, 'GET')
         return conns
 
     def get_connection(self, name):
@@ -694,7 +660,7 @@ class Client(object):
         """
         name = quote(name, '')
         path = Client.urls['connections_by_name'] % name
-        conn = self.http.do_call(path, 'GET')
+        conn = self._call(path, 'GET')
         return conn
 
     def delete_connection(self, name):
@@ -708,7 +674,7 @@ class Client(object):
         """
         name = quote(name, '')
         path = Client.urls['connections_by_name'] % name
-        self.http.do_call(path, 'DELETE')
+        self._call(path, 'DELETE')
         return True
 
     def get_channels(self):
@@ -717,7 +683,7 @@ class Client(object):
         :returns: list of dicts
         """
         path = Client.urls['all_channels']
-        chans = self.http.do_call(path, 'GET')
+        chans = self._call(path, 'GET')
         return chans
 
     def get_channel(self, name):
@@ -730,7 +696,7 @@ class Client(object):
         """
         name = quote(name, '')
         path = Client.urls['channels_by_name'] % name
-        chan = self.http.do_call(path, 'GET')
+        chan = self._call(path, 'GET')
         return chan
 
     def get_bindings(self):
@@ -739,7 +705,7 @@ class Client(object):
 
         """
         path = Client.urls['all_bindings']
-        bindings = self.http.do_call(path, 'GET')
+        bindings = self._call(path, 'GET')
         return bindings
 
     def get_queue_bindings(self, vhost, qname):
@@ -754,7 +720,7 @@ class Client(object):
         vhost = quote(vhost, '')
         qname = quote(qname, '')
         path = Client.urls['bindings_on_queue'] % (vhost, qname)
-        bindings = self.http.do_call(path, 'GET')
+        bindings = self._call(path, 'GET')
         return bindings
 
     def get_bindings_from_exchange(self, vhost, exch):
@@ -785,7 +751,7 @@ class Client(object):
         path = Client.urls['bindings_between_exch_queue'] % (vhost,
                                                              exchange,
                                                              queue)
-        binding = self.http.do_call(path, 'POST', body=body,
+        binding = self._call(path, 'POST', body=body,
                                     headers=Client.json_headers)
         return binding
 
@@ -807,7 +773,7 @@ class Client(object):
                                                                 exchange,
                                                                 queue,
                                                                 rt_key)
-        return self.http.do_call(path, 'DELETE', headers=Client.json_headers)
+        return self._call(path, 'DELETE', headers=Client.json_headers)
 
     def create_user(self, username, password, tags=""):
         """
@@ -820,7 +786,7 @@ class Client(object):
         """
         path = Client.urls['users_by_name'] % username
         body = json.dumps({'password': password, 'tags': tags})
-        return self.http.do_call(path, 'PUT', body=body,
+        return self._call(path, 'PUT', body=body,
                                  headers=Client.json_headers)
 
     def delete_user(self, username):
@@ -830,4 +796,4 @@ class Client(object):
         :param string username: Name of the user to delete from the server.
         """
         path = Client.urls['users_by_name'] % username
-        return self.http.do_call(path, 'DELETE')
+        return self._call(path, 'DELETE')
